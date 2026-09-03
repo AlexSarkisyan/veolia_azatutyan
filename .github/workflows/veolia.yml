@@ -1,0 +1,46 @@
+name: veolia-watch
+
+on:
+  schedule:
+    # каждые 15 минут; время у GitHub плавает, реальный интервал бывает больше
+    - cron: "*/15 * * * *"
+  workflow_dispatch:        # кнопка ручного запуска на вкладке Actions
+
+permissions:
+  contents: write           # нужно, чтобы коммитить обратно файл состояния
+
+concurrency:
+  group: veolia-watch       # два запуска одновременно устроили бы гонку за state
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Зависимости
+        run: pip install -r requirements.txt
+
+      - name: Проверить канал
+        env:
+          VEOLIA_BOT_TOKEN: ${{ secrets.VEOLIA_BOT_TOKEN }}
+          VEOLIA_CHAT_ID: ${{ secrets.VEOLIA_CHAT_ID }}
+        run: python veolia_watch.py
+
+      - name: Сохранить позицию в канале
+        run: |
+          if [ -z "$(git status --porcelain veolia_state.json)" ]; then
+            echo "состояние не менялось, коммит не нужен"
+            exit 0
+          fi
+          git config user.name  "veolia-watch"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add veolia_state.json
+          git commit -m "state: $(date -u '+%Y-%m-%d %H:%M') UTC"
+          git push || { git pull --rebase && git push; }
