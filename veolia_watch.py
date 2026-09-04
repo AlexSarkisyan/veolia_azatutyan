@@ -22,12 +22,14 @@ veolia_watch.py — следит за каналом @VeoliaJur и пересы�
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import time
 import unicodedata
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -40,6 +42,11 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " \
      "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
 DEFAULT_KEYWORDS = ["Ազատության"]
+
+# Армения не переходит на летнее время, поэтому фиксированный сдвиг корректен
+# круглый год и не тянет за собой пакет tzdata на Windows.
+YEREVAN = timezone(timedelta(hours=4))
+HASH_KEEP = 60          # сколько последних постов держим для отлова правок
 MAX_PAGES = 10          # предохранитель от бесконечной пагинации
 TG_LIMIT = 3900         # запас до лимита Telegram в 4096 символов
 
@@ -54,6 +61,27 @@ def norm(s: str) -> str:
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def local_time(iso: str) -> str:
+    """Время публикации в ереванском поясе с явной подписью.
+
+    Telegram отдаёт datetime в UTC. Без перевода сообщение «отключение
+    с 09:00» соседствовало бы с меткой 05:40, и это сбивает с толку.
+    """
+    try:
+        dt = datetime.fromisoformat(iso)
+    except ValueError:
+        return iso or "время неизвестно"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(YEREVAN).strftime("%Y-%m-%d %H:%M") + " (Ереван)"
+
+
+def text_hash(text: str) -> str:
+    """Отпечаток текста поста. По его изменению ловим правку задним числом:
+    id поста при редактировании не меняется, поэтому иначе правку не увидеть."""
+    return hashlib.sha1(norm(text).encode("utf-8")).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------- парсер
@@ -81,6 +109,9 @@ def parse_posts(html: str):
         for br in node.find_all("br"):
             br.replace_with("\n")
         text = node.get_text("\n")
+        # get_text добавляет свой разделитель поверх уже вставленных \n,
+        # поэтому подряд идущие пустые строки схлопываем до одной
+        text = re.sub(r"\n{3,}", "\n\n", text)
 
         tnode = box.select_one("a.tgme_widget_message_date time")
         date = tnode.get("datetime", "") if tnode else ""
@@ -114,6 +145,10 @@ class ParserBroken(Exception):
 def fetch_since(last_id: int):
     """Забирает посты новее last_id.
 
+    Возвращает пару: (новые посты, все посты базовой страницы). Вторая
+    половина нужна для отлова правок — редактирование не меняет id, так что
+    отследить его можно только сравнением содержимого уже виденных постов.
+
     Базовая страница отдаёт последние ~20 постов и служит заодно проверкой
     живости парсера. Если между запусками канал успел выдать больше, чем
     помещается на странице, недостающее добираем через ?after=.
@@ -123,7 +158,7 @@ def fetch_since(last_id: int):
         raise ParserBroken("на базовой странице канала не найдено ни одного поста")
 
     if not last_id:
-        return base                       # первый запуск: только позиция
+        return base, base                 # первый запуск: только позиция
 
     collected = {p["id"]: p for p in base if p["id"] > last_id}
 
@@ -142,7 +177,7 @@ def fetch_since(last_id: int):
                 break
             cursor = new_cursor
 
-    return [collected[k] for k in sorted(collected)]
+    return [collected[k] for k in sorted(collected)], base
 
 
 def send(token: str, chat_id: str, text: str) -> bool:
@@ -165,27 +200,38 @@ def send(token: str, chat_id: str, text: str) -> bool:
 
 # ---------------------------------------------------------------- состояние
 
-def load_state(path: Path) -> int:
+def load_state(path: Path):
+    """Возвращает (last_id, {id поста: отпечаток текста}).
+
+    Старый формат {"last_id": N} читается как есть — отпечатков в нём просто
+    нет, и правки начнут отслеживаться со следующего запуска."""
     try:
-        return int(json.loads(path.read_text(encoding="utf-8"))["last_id"])
+        data = json.loads(path.read_text(encoding="utf-8"))
+        hashes = {int(k): v for k, v in (data.get("hashes") or {}).items()}
+        return int(data["last_id"]), hashes
     except Exception:
-        return 0
+        return 0, {}
 
 
-def save_state(path: Path, last_id: int) -> None:
+def save_state(path: Path, last_id: int, hashes: dict) -> None:
+    # держим отпечатки только последних постов, иначе файл растёт без предела
+    keep = dict(sorted(hashes.items())[-HASH_KEEP:])
+    payload = {"last_id": last_id,
+               "hashes": {str(k): v for k, v in keep.items()}}
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({"last_id": last_id}), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
     tmp.replace(path)                  # атомарная замена, файл не побьётся
 
 
 # ---------------------------------------------------------------- проход
 
 def run_once(cfg, dry_run=False, send_first=False) -> int:
-    last_id = load_state(cfg["state"])
+    last_id, known = load_state(cfg["state"])
     first_run = last_id == 0
 
     try:
-        posts = fetch_since(last_id)
+        posts, base = fetch_since(last_id)
     except ParserBroken as e:
         log(f"ПАРСЕР СЛОМАН: {e}")
         raise                          # наружу, чтобы запуск упал и пришло письмо
@@ -193,25 +239,38 @@ def run_once(cfg, dry_run=False, send_first=False) -> int:
         log(f"канал недоступен: {e}")
         return last_id
 
-    if not posts:
-        log("новых постов нет")
-        return last_id
+    new_max = max([p["id"] for p in posts] + [last_id])
 
-    new_max = max(p["id"] for p in posts)
-    hits = [(p, matches(p["text"], cfg["keywords"])) for p in posts]
-    hits = [(p, k) for p, k in hits if k]
+    # новые посты
+    hits = [(p, k, False) for p in posts
+            if (k := matches(p["text"], cfg["keywords"]))]
 
-    log(f"постов получено: {len(posts)} | совпадений: {len(hits)}")
+    # правки: пост уже видели, но текст стал другим
+    edited = 0
+    for p in base:
+        if p["id"] > last_id:
+            continue                   # это не правка, а новый пост
+        old = known.get(p["id"])
+        if old and old != text_hash(p["text"]):
+            edited += 1
+            if k := matches(p["text"], cfg["keywords"]):
+                hits.append((p, k, True))
+
+    hits.sort(key=lambda h: h[0]["id"])
+    log(f"постов получено: {len(posts)} | правок: {edited} | "
+        f"к отправке: {len(hits)}")
+
+    fresh_hashes = {**known, **{p["id"]: text_hash(p["text"]) for p in base}}
 
     if first_run and not send_first and not dry_run:
         log(f"первый запуск, отправку пропускаю. Позиция: {new_max}")
-        save_state(cfg["state"], new_max)
+        save_state(cfg["state"], new_max, fresh_hashes)
         return new_max
 
-    for p, keys in hits:
-        body = norm(p["text"]).replace(" ", " ")
-        msg = (f"Veolia Jur — {', '.join(keys)}\n"
-               f"{p['date'][:16].replace('T', ' ')}\n\n"
+    for p, keys, was_edited in hits:
+        head = "Veolia Jur — ОБНОВЛЕНО — " if was_edited else "Veolia Jur — "
+        msg = (f"{head}{', '.join(keys)}\n"
+               f"{local_time(p['date'])}\n\n"
                f"{p['text'].strip()}\n\n"
                f"{POST_URL.format(p['id'])}")
         if dry_run:
@@ -219,11 +278,12 @@ def run_once(cfg, dry_run=False, send_first=False) -> int:
             print(msg)
         else:
             ok = send(cfg["token"], cfg["chat_id"], msg)
-            log(f"пост {p['id']}: {'отправлен' if ok else 'НЕ отправлен'}")
+            mark = " (правка)" if was_edited else ""
+            log(f"пост {p['id']}{mark}: {'отправлен' if ok else 'НЕ отправлен'}")
             time.sleep(1)              # не долбим Bot API
 
     if not dry_run:
-        save_state(cfg["state"], new_max)
+        save_state(cfg["state"], new_max, fresh_hashes)
     return new_max
 
 
@@ -277,7 +337,7 @@ def selftest() -> int:
     def block(_url, timeout=20):
         raise AssertionError("лишний сетевой запрос: " + _url)
 
-    real_fetch = M.fetch
+    real_fetch, real_send = M.fetch, M.send
 
     # 1) пустая страница должна возбуждать ParserBroken
     M.fetch = lambda url, timeout=20: "<html><body>ничего</body></html>"
@@ -302,7 +362,7 @@ def selftest() -> int:
                        f'</time></a></div>' for i in (14409, 14410))
 
     M.fetch = paged
-    got = [p["id"] for p in M.fetch_since(14404)]
+    got = [p["id"] for p in M.fetch_since(14404)[0]]
     assert got == [14405, 14406, 14409, 14410], f"добор пропусков не сработал: {got}"
     print("добор пропусков: разрыв 14405-14406 подтянут через ?after=")
 
@@ -316,11 +376,58 @@ def selftest() -> int:
                        f'</time></a></div>' for i in (14409, 14410))
 
     M.fetch = once
-    got = [p["id"] for p in M.fetch_since(14408)]
+    got = [p["id"] for p in M.fetch_since(14408)[0]]
     assert got == [14409, 14410], f"лишние или потерянные посты: {got}"
     print("экономия запросов: без разрыва вторая страница не запрашивается")
 
     M.fetch = real_fetch
+
+    # 4) перевод времени: UTC 05:40 -> Ереван 09:40
+    got = local_time("2026-09-04T05:40:00+00:00")
+    assert got == "2026-09-04 09:40 (Ереван)", f"перевод времени неверен: {got}"
+    assert local_time("") == "время неизвестно", "пустая дата не обработана"
+    print("время: 05:40 UTC -> 09:40 (Ереван)")
+
+    # 5) сквозной прогон: новый пост, затем его правка
+    import tempfile
+
+    def page_with(text):
+        return (f'<div class="tgme_widget_message" data-post="VeoliaJur/14600">'
+                f'<div class="tgme_widget_message_text">{text}</div>'
+                f'<a class="tgme_widget_message_date">'
+                f'<time datetime="2026-09-04T05:40:00+00:00"></time></a></div>')
+
+    sent = []
+    M.send = lambda token, chat, msg: (sent.append(msg), True)[1]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = {"token": "x", "chat_id": "1", "keywords": DEFAULT_KEYWORDS,
+               "state": Path(tmp) / "state.json"}
+
+        # первый проход: позиция запоминается, отправки нет
+        M.fetch = lambda url, timeout=20: page_with("Ազատության 1-2 шенкери")
+        M.run_once(cfg)
+        assert sent == [], "первый запуск не должен ничего слать"
+        lid, hashes = load_state(cfg["state"])
+        assert lid == 14600 and 14600 in hashes, f"позиция/отпечаток не легли: {lid}"
+
+        # второй проход: текст тот же -> тишина
+        M.run_once(cfg)
+        assert sent == [], "неизменённый пост не должен уходить повторно"
+
+        # третий проход: пост отредактирован -> уходит с пометкой
+        M.fetch = lambda url, timeout=20: page_with("Ազատության 1-2, 4-4/2 шенкери")
+        M.run_once(cfg)
+        assert len(sent) == 1, f"правка не отправлена, сообщений: {len(sent)}"
+        assert "ОБНОВЛЕНО" in sent[0], "нет пометки об обновлении"
+        assert "09:40 (Ереван)" in sent[0], "в сообщении не ереванское время"
+
+        # четвёртый проход: повторов быть не должно
+        M.run_once(cfg)
+        assert len(sent) == 1, "правка ушла повторно"
+
+    print("правки: новый -> тишина -> правка с пометкой -> тишина")
+    M.fetch, M.send = real_fetch, real_send
     print("selftest OK")
     return 0
 
