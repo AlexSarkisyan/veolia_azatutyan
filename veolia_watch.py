@@ -6,7 +6,8 @@ veolia_watch.py — следит за каналом @VeoliaJur и пересы�
 
 Настройка через переменные окружения:
     VEOLIA_BOT_TOKEN   токен бота от @BotFather
-    VEOLIA_CHAT_ID     id чата, куда слать (свой личный id)
+    VEOLIA_CHAT_ID     id чата, куда слать. Несколько адресатов — через
+                       запятую: 529308833,987654321
     VEOLIA_KEYWORDS    ключи через запятую (по умолчанию Ազատության)
     VEOLIA_STATE       путь к файлу состояния (по умолчанию рядом со скриптом)
 
@@ -277,10 +278,14 @@ def run_once(cfg, dry_run=False, send_first=False) -> int:
             print("-" * 60)
             print(msg)
         else:
-            ok = send(cfg["token"], cfg["chat_id"], msg)
             mark = " (правка)" if was_edited else ""
-            log(f"пост {p['id']}{mark}: {'отправлен' if ok else 'НЕ отправлен'}")
-            time.sleep(1)              # не долбим Bot API
+            for chat in cfg["chat_ids"]:
+                # сбой одного адресата не должен мешать остальным: например
+                # если второй получатель ещё не нажал START, Bot API вернёт 403
+                ok = send(cfg["token"], chat, msg)
+                log(f"пост {p['id']}{mark} -> {chat}: "
+                    f"{'отправлен' if ok else 'НЕ отправлен'}")
+                time.sleep(1)          # не долбим Bot API
 
     if not dry_run:
         save_state(cfg["state"], new_max, fresh_hashes)
@@ -398,10 +403,10 @@ def selftest() -> int:
                 f'<time datetime="2026-09-04T05:40:00+00:00"></time></a></div>')
 
     sent = []
-    M.send = lambda token, chat, msg: (sent.append(msg), True)[1]
+    M.send = lambda token, chat, msg: (sent.append((chat, msg)), True)[1]
 
     with tempfile.TemporaryDirectory() as tmp:
-        cfg = {"token": "x", "chat_id": "1", "keywords": DEFAULT_KEYWORDS,
+        cfg = {"token": "x", "chat_ids": ["1", "2"], "keywords": DEFAULT_KEYWORDS,
                "state": Path(tmp) / "state.json"}
 
         # первый проход: позиция запоминается, отправки нет
@@ -418,13 +423,14 @@ def selftest() -> int:
         # третий проход: пост отредактирован -> уходит с пометкой
         M.fetch = lambda url, timeout=20: page_with("Ազատության 1-2, 4-4/2 шенкери")
         M.run_once(cfg)
-        assert len(sent) == 1, f"правка не отправлена, сообщений: {len(sent)}"
-        assert "ОБНОВЛЕНО" in sent[0], "нет пометки об обновлении"
-        assert "09:40 (Ереван)" in sent[0], "в сообщении не ереванское время"
+        assert len(sent) == 2, f"должно уйти обоим адресатам, ушло: {len(sent)}"
+        assert [c for c, _ in sent] == ["1", "2"], f"не те адресаты: {sent}"
+        assert "ОБНОВЛЕНО" in sent[0][1], "нет пометки об обновлении"
+        assert "09:40 (Ереван)" in sent[0][1], "в сообщении не ереванское время"
 
         # четвёртый проход: повторов быть не должно
         M.run_once(cfg)
-        assert len(sent) == 1, "правка ушла повторно"
+        assert len(sent) == 2, "правка ушла повторно"
 
     print("правки: новый -> тишина -> правка с пометкой -> тишина")
     M.fetch, M.send = real_fetch, real_send
@@ -448,18 +454,20 @@ def main() -> int:
     kw = os.environ.get("VEOLIA_KEYWORDS", "")
     cfg = {
         "token": os.environ.get("VEOLIA_BOT_TOKEN", ""),
-        "chat_id": os.environ.get("VEOLIA_CHAT_ID", ""),
+        "chat_ids": [c.strip() for c in
+                     os.environ.get("VEOLIA_CHAT_ID", "").split(",") if c.strip()],
         "keywords": [k.strip() for k in kw.split(",") if k.strip()] or DEFAULT_KEYWORDS,
         "state": Path(os.environ.get(
             "VEOLIA_STATE", Path(__file__).with_name("veolia_state.json"))),
     }
 
-    if not args.dry_run and not (cfg["token"] and cfg["chat_id"]):
+    if not args.dry_run and not (cfg["token"] and cfg["chat_ids"]):
         print("Не заданы VEOLIA_BOT_TOKEN и/или VEOLIA_CHAT_ID.", file=sys.stderr)
         print("Проверить парсер без них: python veolia_watch.py --dry-run", file=sys.stderr)
         return 2
 
-    log(f"ключи: {', '.join(cfg['keywords'])} | состояние: {cfg['state']}")
+    log(f"ключи: {', '.join(cfg['keywords'])} | "
+        f"адресатов: {len(cfg['chat_ids'])} | состояние: {cfg['state']}")
 
     if args.loop:
         while True:
